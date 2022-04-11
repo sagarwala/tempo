@@ -105,7 +105,7 @@ func TestReturnAllHits(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 
 	// find should return both now
-	foundBytes, _, failedBLocks, err := r.Find(context.Background(), util.FakeTenantID, testTraceID, tempodb.BlockIDMin, tempodb.BlockIDMax)
+	foundBytes, _, failedBLocks, err := r.Find(context.Background(), util.FakeTenantID, testTraceID, tempodb.BlockIDMin, tempodb.BlockIDMax, 0, 0)
 	require.NoError(t, err)
 	require.Nil(t, failedBLocks)
 	require.Len(t, foundBytes, 2)
