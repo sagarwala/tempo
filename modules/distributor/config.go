@@ -43,6 +43,9 @@ type Config struct {
 	//  note that setting these two config values reduces tolerance to failures on rollout b/c there is always one guaranteed to be failing replica
 	ExtendWrites bool `yaml:"extend_writes"`
 
+	//allow partial batch failures - this is useful for scenarios where replication is not enabled. It allows partial failures in case of sending data to ingesters
+	AllowPartialFailures bool `yaml:"allow_partial_failures"`
+
 	SearchTagsDenyList []string `yaml:"search_tags_deny_list"`
 
 	// For testing.
@@ -68,4 +71,5 @@ func (cfg *Config) RegisterFlagsAndApplyDefaults(prefix string, f *flag.FlagSet)
 	f.BoolVar(&cfg.LogReceivedSpans.Enabled, util.PrefixConfig(prefix, "log-received-spans.enabled"), false, "Enable to log every received span to help debug ingestion or calculate span error distributions using the logs.")
 	f.BoolVar(&cfg.LogReceivedSpans.IncludeAllAttributes, util.PrefixConfig(prefix, "log-received-spans.include-attributes"), false, "Enable to include span attributes in the logs.")
 	f.BoolVar(&cfg.LogReceivedSpans.FilterByStatusError, util.PrefixConfig(prefix, "log-received-spans.filter-by-status-error"), false, "Enable to filter out spans without status error.")
+	f.BoolVar(&cfg.AllowPartialFailures, prefix+".allow_partial_failures", false, "Allow partial failures in case of sending data to ingesters")
 }

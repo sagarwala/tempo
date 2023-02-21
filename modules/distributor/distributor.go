@@ -5,7 +5,9 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-kit/log"
@@ -104,10 +106,11 @@ var (
 
 // rebatchedTrace is used to more cleanly pass the set of data
 type rebatchedTrace struct {
-	id    []byte
-	trace *tempopb.Trace
-	start uint32 // unix epoch seconds
-	end   uint32 // unix epoch seconds
+	id        []byte
+	trace     *tempopb.Trace
+	start     uint32 // unix epoch seconds
+	end       uint32 // unix epoch seconds
+	spanCount int
 }
 
 // Distributor coordinates replicates and distribution of log streams.
@@ -361,10 +364,18 @@ func (d *Distributor) PushTraces(ctx context.Context, traces ptrace.Traces) (*te
 		return true
 	})
 
-	err = d.sendToIngestersViaBytes(ctx, userID, rebatchedTraces, searchData, keys)
-	if err != nil {
-		recordDiscaredSpans(err, userID, spanCount)
-		return nil, err
+	if d.cfg.AllowPartialFailures {
+		err = d.sendToIngestersViaBytesWithPartialFailures(ctx, userID, rebatchedTraces, searchData, keys)
+		if err != nil {
+			return nil, err
+		}
+
+	} else {
+		err = d.sendToIngestersViaBytes(ctx, userID, rebatchedTraces, searchData, keys)
+		if err != nil {
+			recordDiscaredSpans(err, userID, spanCount)
+			return nil, err
+		}
 	}
 
 	if len(d.overrides.MetricsGeneratorProcessors(userID)) > 0 {
@@ -376,6 +387,71 @@ func (d *Distributor) PushTraces(ctx context.Context, traces ptrace.Traces) (*te
 	}
 
 	return nil, nil // PushRequest is ignored, so no reason to create one
+}
+
+func (d *Distributor) sendToIngestersViaBytesWithPartialFailures(ctx context.Context, userID string, traces []*rebatchedTrace, searchData [][]byte, keys []uint32) error {
+	// Marshal to bytes once
+	marshalledTraces := make([][]byte, len(traces))
+	totalBatchSpanCount := 0
+	for i, t := range traces {
+		b, err := d.traceEncoder.PrepareForWrite(t.trace, t.start, t.end)
+		if err != nil {
+			return errors.Wrap(err, "failed to marshal PushRequest")
+		}
+		marshalledTraces[i] = b
+		totalBatchSpanCount = totalBatchSpanCount + t.spanCount
+	}
+
+	op := ring.WriteNoExtend
+	if d.cfg.ExtendWrites {
+		op = ring.Write
+	}
+
+	var discardedSpanCount uint32 = 0
+	err := ring.DoBatch(ctx, op, d.ingestersRing, keys, func(ingester ring.InstanceDesc, indexes []int) error {
+		localCtx, cancel := context.WithTimeout(ctx, d.clientCfg.RemoteTimeout)
+		defer cancel()
+		localCtx = user.InjectOrgID(localCtx, userID)
+
+		req := tempopb.PushBytesRequest{
+			Traces:     make([]tempopb.PreallocBytes, len(indexes)),
+			Ids:        make([]tempopb.PreallocBytes, len(indexes)),
+			SearchData: make([]tempopb.PreallocBytes, len(indexes)),
+		}
+
+		spanCount := 0
+		for i, j := range indexes {
+			req.Traces[i].Slice = marshalledTraces[j][0:]
+			req.Ids[i].Slice = traces[j].id
+			spanCount = traces[j].spanCount
+
+			// Search data optional
+			if len(searchData) > j {
+				req.SearchData[i].Slice = searchData[j]
+			}
+		}
+
+		c, err := d.pool.GetClientFor(ingester.Addr)
+		if err != nil {
+			return err
+		}
+
+		_, err = c.(tempopb.PusherClient).PushBytesV2(localCtx, &req)
+		metricIngesterAppends.WithLabelValues(ingester.Addr).Inc()
+		if err != nil {
+			atomic.AddUint32(&discardedSpanCount, uint32(spanCount))
+			recordDiscaredSpans(err, userID, spanCount)
+			metricIngesterAppendFailures.WithLabelValues(ingester.Addr).Inc()
+			level.Error(d.logger).Log("Error:", "spans discarded, count : "+strconv.Itoa(spanCount))
+			level.Error(d.logger).Log("Error:", err.Error())
+		}
+		return nil
+	}, func() {})
+
+	if discardedSpanCount != 0 && int(discardedSpanCount) == totalBatchSpanCount { //we can add percentage as well (90% discarded)
+		return errors.New("UNAVAILABLE: Spans discarded Count " + strconv.Itoa(int(discardedSpanCount)))
+	}
+	return err
 }
 
 func (d *Distributor) sendToIngestersViaBytes(ctx context.Context, userID string, traces []*rebatchedTrace, searchData [][]byte, keys []uint32) error {
@@ -511,8 +587,9 @@ func requestsByTraceID(batches []*v1.ResourceSpans, userID string, spanCount int
 						trace: &tempopb.Trace{
 							Batches: make([]*v1.ResourceSpans, 0, spanCount/tracesPerBatch),
 						},
-						start: math.MaxUint32,
-						end:   0,
+						start:     math.MaxUint32,
+						end:       0,
+						spanCount: len(existingILS.Spans),
 					}
 
 					tracesByID[traceKey] = existingTrace
@@ -525,6 +602,7 @@ func requestsByTraceID(batches []*v1.ResourceSpans, userID string, spanCount int
 				if existingTrace.start > start {
 					existingTrace.start = start
 				}
+				existingTrace.spanCount = len(existingILS.Spans)
 				if !ilsAdded {
 					existingTrace.trace.Batches = append(existingTrace.trace.Batches, &v1.ResourceSpans{
 						Resource:   b.Resource,
